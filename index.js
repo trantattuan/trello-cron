@@ -3,23 +3,20 @@ const http = require('http')
 const url = require('url')
 
 const API_BASE = process.env.API_BASE || 'http://api:3001'
-const EMAIL = process.env.CRON_EMAIL || 'admin@gmail.com'
-const PASSWORD = process.env.CRON_PASSWORD || '123456'
-const TARGET_WORKSPACE = process.env.TARGET_WORKSPACE || '1'
-const TARGET_BOARD = process.env.TARGET_BOARD || '1'
-const TARGET_LIST = process.env.TARGET_LIST || 'việc phải làm'
-const INTERVAL_MS = parseInt(process.env.INTERVAL_MS || '180000') // 3 minutes
+const CRON_SECRET = process.env.CRON_SECRET || ''
+const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '60000') // 60s
 
-let token = null
-
-function request(method, path, body, auth) {
+function request(method, path, body, extraHeaders) {
   return new Promise((resolve, reject) => {
     const parsed = new url.URL(API_BASE + path)
     const isHttps = parsed.protocol === 'https:'
     const lib = isHttps ? https : http
     const data = body ? JSON.stringify(body) : null
-    const headers = { 'Content-Type': 'application/json' }
-    if (auth) headers['Authorization'] = `Bearer ${auth}`
+    const headers = {
+      'Content-Type': 'application/json',
+      'x-cron-secret': CRON_SECRET,
+      ...extraHeaders,
+    }
     if (data) headers['Content-Length'] = Buffer.byteLength(data)
 
     const req = lib.request({
@@ -42,65 +39,96 @@ function request(method, path, body, auth) {
   })
 }
 
-async function login() {
-  const res = await request('POST', '/auth/login', { email: EMAIL, password: PASSWORD })
-  if (res.status !== 200) throw new Error(`Login failed: ${JSON.stringify(res.body)}`)
-  token = res.body.token
-  console.log(`[${ts()}] Logged in as ${EMAIL}`)
-}
-
-async function findListId() {
-  const wsRes = await request('GET', '/workspaces', null, token)
-  if (wsRes.status !== 200) throw new Error('Failed to get workspaces')
-
-  const ws = wsRes.body.find((w) => w.name === TARGET_WORKSPACE || w.id === TARGET_WORKSPACE)
-  if (!ws) throw new Error(`Workspace "${TARGET_WORKSPACE}" not found`)
-
-  const wsDetail = await request('GET', `/workspaces/${ws.id}`, null, token)
-  const board = (wsDetail.body.boards || []).find((b) => b.title === TARGET_BOARD || b.id === TARGET_BOARD)
-  if (!board) throw new Error(`Board "${TARGET_BOARD}" not found`)
-
-  const boardRes = await request('GET', `/boards/${board.id}`, null, token)
-  const list = (boardRes.body.lists || []).find((l) => l.title === TARGET_LIST)
-  if (!list) throw new Error(`List "${TARGET_LIST}" not found`)
-
-  return list.id
-}
-
-async function addCard(listId) {
-  const title = `Auto card ${ts()}`
-  const res = await request('POST', '/cards', { listId, title }, token)
-  if (res.status !== 201) throw new Error(`Create card failed: ${JSON.stringify(res.body)}`)
-  console.log(`[${ts()}] Created card: "${title}" in list "${TARGET_LIST}"`)
-}
-
 function ts() {
   return new Date().toISOString().replace('T', ' ').slice(0, 19)
 }
 
+// Parse "*/N * * * *" → interval in minutes, return null for unsupported patterns
+function parseMinuteInterval(expr) {
+  if (!expr) return null
+  const parts = expr.trim().split(/\s+/)
+  if (parts.length !== 5) return null
+  const [min, hour, dom, month, dow] = parts
+  if (hour !== '*' || dom !== '*' || month !== '*' || dow !== '*') return null
+  const m = min.match(/^\*\/(\d+)$/)
+  if (m) return parseInt(m[1])
+  if (min === '*') return 1
+  return null
+}
+
+function isDue(job) {
+  const now = new Date()
+
+  // One-time job
+  if (job.scheduledAt && !job.cronExpression) {
+    return !job.lastRunAt && new Date(job.scheduledAt) <= now
+  }
+
+  // Recurring job
+  if (job.cronExpression) {
+    const intervalMin = parseMinuteInterval(job.cronExpression)
+    if (intervalMin === null) {
+      console.warn(`[${ts()}] Unsupported cron expression "${job.cronExpression}" for job ${job.id}`)
+      return false
+    }
+    if (!job.lastRunAt) return true
+    const msElapsed = now - new Date(job.lastRunAt)
+    return msElapsed >= intervalMin * 60 * 1000
+  }
+
+  return false
+}
+
+async function createCard(listId, title) {
+  const res = await request('POST', '/cards', { listId, title }, {})
+  if (res.status !== 201) throw new Error(`Create card failed: ${JSON.stringify(res.body)}`)
+  return res.body
+}
+
+async function markRun(jobId) {
+  await request('PATCH', `/schedules/${jobId}/run`, null, {})
+}
+
+async function poll() {
+  const res = await request('GET', '/schedules/pending', null, {})
+  if (res.status !== 200) {
+    console.error(`[${ts()}] Failed to fetch pending jobs: ${res.status}`)
+    return
+  }
+
+  const jobs = Array.isArray(res.body) ? res.body : []
+  const due = jobs.filter(isDue)
+
+  if (due.length === 0) return
+
+  console.log(`[${ts()}] ${due.length} job(s) due`)
+
+  for (const job of due) {
+    try {
+      const cardTitle = job.title.replace('{date}', ts())
+      const card = await createCard(job.listId, cardTitle)
+      await markRun(job.id)
+      console.log(`[${ts()}] Job ${job.id}: created card "${card.title}"`)
+    } catch (err) {
+      console.error(`[${ts()}] Job ${job.id} error:`, err.message)
+    }
+  }
+}
+
 async function run() {
-  try {
-    await login()
-    const listId = await findListId()
-    console.log(`[${ts()}] Target list ID: ${listId} — running every ${INTERVAL_MS / 1000}s`)
-
-    await addCard(listId)
-
-    setInterval(async () => {
-      try {
-        await addCard(listId)
-      } catch (err) {
-        console.error(`[${ts()}] Error:`, err.message)
-        // re-login on auth error
-        if (err.message.includes('401') || err.message.includes('auth')) {
-          try { await login() } catch {}
-        }
-      }
-    }, INTERVAL_MS)
-  } catch (err) {
-    console.error(`[${ts()}] Startup error:`, err.message)
+  if (!CRON_SECRET) {
+    console.error(`[${ts()}] CRON_SECRET is not set — aborting`)
     process.exit(1)
   }
+
+  console.log(`[${ts()}] Cron service started, polling every ${POLL_INTERVAL_MS / 1000}s`)
+
+  // Initial poll
+  try { await poll() } catch (err) { console.error(`[${ts()}] Poll error:`, err.message) }
+
+  setInterval(async () => {
+    try { await poll() } catch (err) { console.error(`[${ts()}] Poll error:`, err.message) }
+  }, POLL_INTERVAL_MS)
 }
 
 run()
