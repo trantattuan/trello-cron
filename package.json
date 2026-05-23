@@ -1,0 +1,9 @@
+{
+  "name": "trello-cron",
+  "version": "1.0.0",
+  "description": "Cron jobs for Trello clone",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  }
+}
